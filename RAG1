@@ -1,0 +1,130 @@
+import os
+import hashlib
+import streamlit as st
+from openai import OpenAI
+import chromadb
+from sentence_transformers import SentenceTransformer
+from pypdf import PdfReader
+import docx
+import tempfile
+
+OPENAI_API_KEY = "YOUR-API KEY" 
+LLM_MODEL = "gpt-4o-mini"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+st.set_page_config(page_title="RAG AI Assistant", layout="wide")
+
+
+class RAGCore:
+    def __init__(self):
+        self.client = chromadb.PersistentClient(path="./chroma_db")
+        self.collection = self.client.get_or_create_collection(name="my_docs")
+        self.embed_model = SentenceTransformer(EMBEDDING_MODEL)
+        self.openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+    def process_file(self, uploaded_file):
+        """Extract text, split into chunks, and save to ChromaDB"""
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tf.write(uploaded_file.getbuffer())
+            file_path = tf.name
+
+        ext = os.path.splitext(uploaded_file.name)[1].lower()
+        text = ""
+        
+        try:
+            if ext == ".pdf":
+                reader = PdfReader(file_path)
+                text = "\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
+            elif ext == ".docx":
+                doc = docx.Document(file_path)
+                text = "\n".join([p.text for p in doc.paragraphs])
+            else:
+                text = uploaded_file.read().decode("utf-8", errors="ignore")
+            chunk_size = 700
+            chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size - 100)]
+            ids = [f"{uploaded_file.name}_{i}" for i in range(len(chunks))]
+            embeddings = self.embed_model.encode(chunks).tolist()
+            metadatas = [{"source": uploaded_file.name} for _ in chunks]
+            
+            self.collection.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
+            return True
+        except Exception as e:
+            st.error(f"Error processing file: {e}")
+            return False
+        finally:
+            os.remove(file_path)
+
+    def get_context(self, query):
+        """Search vector store for relevant chunks"""
+        query_emb = self.embed_model.encode([query]).tolist()
+        results = self.collection.query(query_embeddings=query_emb, n_results=4)
+        
+        if not results['documents'] or not results['documents'][0]:
+            return None, None
+            
+        context = "\n\n".join(results['documents'][0])
+        sources = list(set([m['source'] for m in results['metadatas'][0]]))
+        return context, sources
+
+
+def main():
+    st.title("RAG Document Assistant")
+    if "rag" not in st.session_state:
+        st.session_state.rag = RAGCore()
+    # Initialize Chat History
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    # --- SIDEBAR: Uploads & Stats ---
+    with st.sidebar:
+        st.header("Document Management")
+        uploaded_files = st.file_uploader("Upload PDF, DOCX, or TXT", accept_multiple_files=True)
+        
+        if st.button("Process Documents"):
+            if uploaded_files:
+                for f in uploaded_files:
+                    with st.spinner(f"Indexing {f.name}..."):
+                        st.session_state.rag.process_file(f)
+                st.success("Indexing complete!")
+            else:
+                st.warning("Please upload files first.")
+
+        if st.button("Clear Database"):
+            st.session_state.rag.client.delete_collection("my_docs")
+            st.session_state.rag.collection = st.session_state.rag.client.get_or_create_collection("my_docs")
+            st.success("Database cleared.")
+    
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask a question about your documents..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        context, sources = st.session_state.rag.get_context(prompt)
+        
+        with st.chat_message("assistant"):
+            if not context:
+                response_text = "I don't have any documents indexed yet. Please upload files in the sidebar."
+                st.markdown(response_text)
+            else:
+               
+                full_prompt = f"Context from documents:\n{context}\n\nQuestion: {prompt}"
+                
+                stream = st.session_state.rag.openai_client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a professional assistant. Answer based ONLY on context."},
+                        *st.session_state.messages[-5:], # Include last 5 messages for memory
+                        {"role": "user", "content": full_prompt}
+                    ],
+                    stream=True,
+                )
+                response_text = st.write_stream(stream)
+                
+                if sources:
+                    st.caption(f"Sources: {', '.join(sources)}")
+        st.session_state.messages.append({"role": "assistant", "content": response_text})
+
+if __name__ == "__main__":
+    main()
