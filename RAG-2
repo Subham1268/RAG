@@ -1,0 +1,99 @@
+import os
+import numpy as np
+import gradio as gr
+from pypdf import PdfReader
+from openai import OpenAI
+
+
+client = OpenAI(api_key="API-KEY")
+chunk_embeddings = []
+
+def extract_text_from_pdf(pdf_path):
+    """Extracts raw text from a PDF file."""
+    reader = PdfReader(pdf_path)
+    text = ""
+    for page in reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            text += extracted + "\n"
+    return text
+
+def create_chunks(text, chunk_size=1000, overlap=100):
+    """Splits text into manageable pieces manually."""
+    local_chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        local_chunks.append(text[start:end])
+        start += (chunk_size - overlap)
+    return local_chunks
+
+def get_openai_embeddings(text_list):
+    """Converts a list of text strings into vectors using OpenAI."""
+    response = client.embeddings.create(
+        input=text_list,
+        model="text-embedding-3-small"
+    )
+    return np.array([item.embedding for item in response.data])
+
+def process_pdf(file):
+    global chunks, chunk_embeddings
+    if file is None:
+        return "❌ Please upload a PDF."
+    
+    try:
+        raw_text = extract_text_from_pdf(file.name)
+        chunks = create_chunks(raw_text)
+        chunk_embeddings = get_openai_embeddings(chunks)
+        
+        return f"PDF Processed! Created {len(chunks)} chunks. You can now chat."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def cosine_similarity(v1, v2):
+    """Calculates how similar two vectors are (math behind the search)."""
+    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+def ask_question(question, history):
+    global chunks, chunk_embeddings
+    if not chunks:
+        return "Please upload a PDF first."
+
+    query_response = client.embeddings.create(
+        input=[question],
+        model="text-embedding-3-small"
+    )
+    query_embedding = np.array(query_response.data[0].embedding)
+
+    similarities = [cosine_similarity(query_embedding, chunk_vec) for chunk_vec in chunk_embeddings]
+
+    top_indices = np.argsort(similarities)[-3:][::-1]
+    retrieved_context = "\n\n".join([chunks[i] for i in top_indices])
+    
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant. Use the provided context to answer the user's question accurately. If the answer isn't in the context, say you don't know."},
+            {"role": "user", "content": f"Context:\n{retrieved_context}\n\nQuestion: {question}"}
+        ],
+        temperature=0
+    )
+    
+    return response.choices[0].message.content
+
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🚀 All-OpenAI Manual RAG")
+    gr.Markdown("No LangChain. No local models. Pure OpenAI API.")
+    
+    with gr.Row():
+        with gr.Column(scale=1):
+            pdf_input = gr.File(label="1. Upload Policy PDF", file_types=[".pdf"])
+            status = gr.Textbox(label="Status", interactive=False)
+        
+        with gr.Column(scale=2):
+            chat = gr.ChatInterface(fn=ask_question, title="2. Ask Questions")
+
+    pdf_input.upload(fn=process_pdf, inputs=pdf_input, outputs=status)
+
+if __name__ == "__main__":
+    demo.launch()
